@@ -1,0 +1,47 @@
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+def runcommand (host):
+     """ Run ssh in a subprocess and execute command
+         returns a tuple (stdout, stderr, exitcode) """
+
+     def kill_proc(proc, timedout):
+          timedout["value"] = True
+          proc.kill()
+
+     print(startthread),
+     if not dryrun:
+          timeout = "-o ConnectTimeout=" + str(connect_timeout) # TODO set this some other way
+          nox11 = "-o ForwardX11=no"
+          options = "-o ForwardX11=no -o PasswordAuthentication=no -o PreferredAuthentications=gssapi-keyex,gssapi-with-mic"
+          gssapi = "-o PreferredAuthentications=gssapi-keyex,gssapi-with-mic,publickey"
+          remote_command = "PATH=%s; %s" % (remote_path, command)
+          # ----------------------------------------------------------
+          ssh = Popen(["ssh", "%s" % host, timeout, nox11, gssapi, remote_command], shell=False, stdout=PIPE, stderr=PIPE)
+          #ssh = Popen(["rsh", "%s" % host, remote_command], shell=False, stdout=PIPE, stderr=PIPE) # TODO rsh still doesn't work right, op really needs ssh
+          # ----------------------------------------------------------
+          timedout = {"value": False}
+          timer = Timer(execution_timeout, kill_proc, [ssh, timedout])
+          timer.start()
+          (result,errors) = ssh.communicate()
+          timer.cancel()
+          return_value=ssh.returncode
+          # ----------------------------------------------------------
+          # execution timeout, we had to kill it
+          if timedout["value"]:
+               return_value = -255
+               errors = errors + "EXECUTION TIMEOUT (%s seconds)" % execution_timeout
+          # ----------------------------------------------------------
+          result = result.strip()
+          errors = errors.strip()
+     else:
+          result = ''
+          errors = ''
+          return_value=0
+     print(stopthread),
+
+     if result == '':
+          result = host
+     else:
+          result = host + '\n' + ''.join(result)
+
+     return (result,errors,return_value)
+
