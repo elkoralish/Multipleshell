@@ -1,0 +1,419 @@
+#!/opt/swt/bin/python
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+#
+# Script: mush (formerly PyRate)
+# Author: Chris Regenye (DevEngineering)
+# Date:   10/30/2014
+# Info:   Python treatment of the existing 'rate' script.
+#         Executes host connections in individually threaded subprocesses to speed
+#         overall execution.  At this time it does have some restrictions in that
+#         it will only use the ssh protocol with gssapi or publickey
+#         authentication (so it will not work for the local op user) and all other
+#         host designation modes have been discarded in favor of a symV syntax.
+#
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+import sys
+import os
+import grp
+import pwd
+import getpass
+import socket
+from datetime import datetime
+from subprocess import Popen
+from subprocess import PIPE
+from optparse import OptionParser
+from operator import itemgetter
+from multiprocessing.dummy import Pool as ThreadPool
+from threading import Timer
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# get options and arguments
+use = '\nmush [OPTION]...  --superquote|"command"\n\nmush is a multihost command tool\nhopefully an improvement on the old "rate" command\n\n* "command" should be quoted appropriately to protect it from expansion by the\n   shell on the local machine.\n* "symV expression" is a valid set expression using\n   rhst groups, host names, node numbers, owners or aliases\n   [operators: "-" (difference) "^" (intersection)]'
+
+parser = OptionParser(usage = use)
+
+parser.add_option("-d", "--dryrun",
+                  dest="dryrun", action="store_true", default=False,
+                  help="Do not actually do anything, just go through the motions of building the host list")
+
+parser.add_option("-k","--keys",
+                  dest="keysonly", action="store_true", default=False,
+                  help="Disables the check for (and requirement for) valid KRB5 creds, use if you strictly use ssh keys to connect to the destination hosts")
+
+parser.add_option("-n", "--nocolor",
+                  dest="monochrome", action="store_true", default=False,
+                  help="Do not use color in dislplay output")
+
+parser.add_option("-p","--path",
+                  dest="path", type="string", default="/opt/bb/bin:/usr/bin:/bin:/opt/quest/bin:/bb/bin:/ts/bin",
+                  help="Alternate remote $PATH [PATH=/opt/bb/bin:/usr/bin:/bin:/opt/quest/bin:/bb/bin:/ts/bin]")
+                  # TODO swap position of /opt/bb/bin in path if sudo is present in the commandline
+
+parser.add_option("-v", "--verbose",
+                  dest="verbose", action="store_true", default=False,
+                  help="Verbose mode displays full bbcpu entry")
+
+parser.add_option("--exec_timeout",
+                  metavar="sec", dest="execseconds", action="store", default=90,
+                  help="Time out for execution of remote command after connection in seconds [90s]")
+
+parser.add_option("--tcp_timeout",
+                  metavar="sec", dest="tcpseconds", action="store", default=10,
+                  help="Time out for TCP connection in seconds (passed directly to ssh) [10s]")
+
+parser.add_option("--true",
+                  metavar="sec", dest="testpositive", action="store_true", default=False,
+                  help="Do not show results, print hostnames where the command had an exit 0 (true)")
+
+parser.add_option("--false",
+                  metavar="sec", dest="testnegative", action="store_true", default=False,
+                  help="Do not show results, print hostnames where the command had a non-zero exit (false)")
+
+parser.add_option("--superquote",
+                  dest="superquote", action="store_true", default=False,
+                  help="Superquote mode. User will be prompted for the command(s) to run, this string will be protected from the shell and not expanded until it reaches the remote system")
+
+parser.add_option("--symv",
+                  action="store", dest="expr", default=False,
+                  help="Host expression given inline (must use quotes for more than one term). User will be prompted if not supplied")
+
+options, arguments = parser.parse_args()
+command = ' '.join(arguments)
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# variables
+logfilename = "/home/testadmn/logs/newratelog.tmp"
+printexit = False
+connect_timeout = options.tcpseconds
+remote_path = options.path
+verbose = options.verbose
+dryrun = options.dryrun
+keysonly = options.keysonly
+execution_timeout = int(options.execseconds)
+connectionerrors = []
+sep = "-" * 50
+sep2 = "= " + ("-" * 48)
+slashline = '/' * 45
+slashline = '/' * 50
+chevron = '>>>'
+startthread = 'O'
+stopthread = '.'
+if not options.monochrome:
+     colorred = "\033[31m{0}\033[00m"
+     colorbrightred = "\033[01;31m{0}\033[00m"
+     colorgreen = "\033[01;32m{0}\033[00m"
+     coloryellow = "\033[01;33m{0}\033[00m"
+     colorlightblue = "\033[01;36m{0}\033[00m"
+     slashline = colorgreen.format(slashline)
+     chevron = colorbrightred.format(chevron)
+     startthread = colorlightblue.format(startthread)
+     stopthread = colorlightblue.format(stopthread)
+usergroups = [grp.getgrgid(g).gr_name for g in os.getgroups()]
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+def timestamp (): return datetime.now().strftime('%Y/%m/%d %H:%M:%S')
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# build bbhosts object
+def bbhostgrab ():
+     """ reads the bbhosts and bbaiases, returns a list of each """
+     cpulist = open('/bb/bin/bbcpu.lst')
+     bbhosts = []
+     for bbhost in cpulist:
+          bbhosts.append(tuple(bbhost.split()))
+     cpulist.close()
+     aliaslist = open('/bb/bin/bbcpu.alias')
+     bbaliases = []
+     for bbalias in aliaslist:
+          bbaliases.append(tuple(bbalias.split()))
+     return bbhosts, bbaliases
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+def symv_cull (tag, bbhosts, bbaliases):
+     """ takes an individual symv item and returns a set of matching lines
+         as well as a set operator based on the first character of the item """
+     if tag == "localhost" : tag = os.uname()[1]
+     returnset = set()
+
+     prefix = tag[0]
+     if prefix == '^': mode = 'intersection'
+     elif prefix == '~' or prefix == '-': mode = 'difference'
+     else: mode = 'union'
+     if not mode == 'union': tag = tag[1:]
+
+     for entry in bbhosts:
+          if tag in entry:
+               returnset.add(entry[0])
+     if len(returnset) == 0:
+          for entry in bbaliases:
+               if tag in entry:
+                    returnset.add(entry[1])
+
+     return returnset, mode
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+def runcommand (host):
+     """ Run ssh in a subprocess and execute command
+         returns a tuple (stdout, stderr, exitcode) """
+
+     def kill_proc(proc, timedout):
+          timedout["value"] = True
+          proc.kill()
+
+     print(startthread),
+     if not dryrun:
+          timeout = "-o ConnectTimeout=" + str(connect_timeout) # TODO set this some other way
+          nox11 = "-o ForwardX11=no"
+          options = "-o ForwardX11=no -o PasswordAuthentication=no -o PreferredAuthentications=gssapi-keyex,gssapi-with-mic"
+          gssapi = "-o PreferredAuthentications=gssapi-keyex,gssapi-with-mic,publickey"
+          remote_command = "PATH=%s; %s" % (remote_path, command)
+          # ----------------------------------------------------------
+          ssh = Popen(["ssh", "%s" % host, timeout, nox11, gssapi, remote_command], shell=False, stdout=PIPE, stderr=PIPE)
+          #ssh = Popen(["rsh", "%s" % host, remote_command], shell=False, stdout=PIPE, stderr=PIPE) # TODO rsh still doesn't work right, op really needs ssh
+          # ----------------------------------------------------------
+          timedout = {"value": False}
+          timer = Timer(execution_timeout, kill_proc, [ssh, timedout])
+          timer.start()
+          (result,errors) = ssh.communicate()
+          timer.cancel()
+          return_value=ssh.returncode
+          # ----------------------------------------------------------
+          # execution timeout, we had to kill it
+          if timedout["value"]:
+               return_value = -255
+               errors = errors + "EXECUTION TIMEOUT (%s seconds)" % execution_timeout
+          # ----------------------------------------------------------
+          result = result.strip()
+          errors = errors.strip()
+     else:
+          result = ''
+          errors = ''
+          return_value=0
+     print(stopthread),
+
+     if result == '':
+          result = host
+     else:
+          result = host + '\n' + ''.join(result)
+
+     return (result,errors,return_value)
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+def vasvalidate ():
+     """ Check for and if necessary obtain KRB5 token """
+     checktoken = Popen(["/opt/quest/bin/vastool", "klist"], shell=False, stdout=PIPE, stderr=PIPE)
+     (output, errors) = checktoken.communicate()
+     goodtoken = checktoken.wait()
+     if not goodtoken == 0:
+          print("Your KRB5 token appears to be expired or invalid, let's get a new one")
+          gettoken = Popen(["/opt/quest/bin/vastool", "-s", "kinit"], shell=False, stdin=PIPE, stdout=PIPE)
+          junk = gettoken.communicate(input=getpass.getpass("Toolkit(ADDEV) Password: "))[0]
+          goodtoken = gettoken.wait()
+          if not goodtoken == 0:
+               print("\nHrm... problem refreshing your creds, try running 'vastool kinit' from the command line\n")
+               exit(1)
+
+# =-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+def parsecommand (commandinput, numberofmachines):
+     """ Issue warning to user and get confirm if any command on restricted list is entered"""
+     redflags=["rm", "init", "sudo", "mkfs", "reboot", "rstrt", "dbdwn"]
+     compoundcommand = commandinput.split(';')
+     warncommands = [command for command in compoundcommand for flag in redflags if flag in command]
+     if len(warncommands) >= 1:
+          if len(warncommands) == 1:
+               plural = ["this command"]
+          else:
+               plural = ["these commands"]
+          if numberofmachines > 1:
+               plural.append("machines")
+          else:
+               plural.append("machine")
+          print("\nSome of these commands can be destructive, please confirm")
+          print("Are sure you want to run %s on %s %s?" % (plural[0], numberofmachines, plural[1]))
+          print("It will be logged")
+          print("\n%s\n" % sep)
+          for command in warncommands:
+               print(command)
+          confirm = raw_input("\n[ Y/n ]? ")
+          if not confirm == "Y":
+               print("\nBailing out at request of user\n")
+               exit(255)
+          print("Confirmed, proceeding.")
+
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# =-=   Main  =-=
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+user_id = pwd.getpwuid(os.getuid())[0]
+try:
+     login_id = os.getlogin()
+except:
+     login_id = "Unknown" # tmux and probably other things that don't register with utmp
+                          # cause errors here.  TODO: find a way to get this info in this case
+
+if not user_id == login_id: user_id = "%s (%s)" % (user_id, login_id)
+hostname = socket.gethostname()
+
+# -------------------------------
+# Check user's KRB5 credcache, get a new token if there's a problem (dev specific)
+if not keysonly: vasvalidate()
+
+# -------------------------------
+# Get command if superquoted
+if options.superquote:
+     command = raw_input('\nEnter the command to be run\nIt will not be expanded until it reaches the remote machine:\n\n')
+
+# -------------------------------
+# Check command, if not present print help
+if len(command) == 0 and not options.dryrun:
+     parser.print_help()
+     exit(1)
+
+# -------------------------------
+# Get symV if not given inline
+if options.expr:
+     symv_spec = options.expr.lower().split()
+else:
+     symv_spec = raw_input('\nEnter and expression in SYMV syntax as you would in a PRQS PK\nINCLUDE:\n\n').lower().split()
+     if len(symv_spec) == 0:
+          print('\nBad symV expression: %s\n' % symv_spec)
+          parser.print_help()
+          exit(2)
+
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# this loop processes the symv, whether it's inline as an arg or interactive
+bbhosts, bbaliases = bbhostgrab()
+resultset = set()
+for item in symv_spec:
+     newset, mode = symv_cull(item, bbhosts, bbaliases)
+     resultset = getattr(resultset, mode) (newset)
+
+# -------------------------------
+# Check for privledge group(s)
+if not "testadmn" in usergroups and not dryrun:
+     if not (sys.stdout.isatty()):
+          print('Sorry, %s is intended for interactive use only. ' % sys.argv[0])
+          print('Options can and will change without warning and we do not want automated procedures breaking')
+          exit(3)
+     parsecommand(command, len(resultset))
+else:
+     print("Privledged user, command confirm and tty check disabled")
+     remote_path = "/home/testadmn/bin:" + remote_path
+
+# -------------------------------
+# Log command, bail if we can't
+try:
+     logfile = open(logfilename, 'w')
+     logfile.write('%s %s RAN: "%s" ON: "%s" FROM: "%s"\n' % (timestamp(), user_id, command, ' '.join(symv_spec), hostname))
+     logfile.close()
+except:
+     print("\nTemporary problem logging this command,")
+     print("it's probably NFS related rerun or try from another machine\n")
+     exit(4)
+
+# -----------------------------
+# summary output
+print('\n%s: MUltiple SHell invoked\n' % sys.argv[0].split('/')[-1])
+print('\nRun: %s\nOn hosts that match: %s [%s hosts]\n' % (command,' '.join(symv_spec), len(resultset)))
+if verbose:
+     print('Hostnames:\n\n%s\n\n' % ' '.join(resultset))
+     print('\t" %s "\n\twill be run on %s hosts\n' % (command,len(resultset)))
+
+
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# actually do the work!
+# create thread pool, run command in threads (dotmatrix output)
+print(sep)
+pool = ThreadPool(20)
+# TODO look into concurrent.futures.ProcessPoolExecutor to bypass the
+# global interpreter lock issue.
+results = pool.map(runcommand,resultset) # wait here until threads exit
+print
+print(sep)
+
+# =-=-=-=-=-=-=-==-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+# display output
+# -----------------------------
+# normal output
+print('\n%s\n' % slashline)
+if not options.testpositive and not options.testnegative:
+     for result in sorted(results, key=itemgetter(0)):
+          print(sep)
+          #
+          #  result = (stdout, stderr, retcode)
+          #
+          if result[2] == 0:
+               print(result[0])
+               if printexit: print('exit %s' % result[2])
+          else:
+               print(result[0])
+               if not options.monochrome:
+                    print(colorred.format(result[1]).strip())
+                    if printexit: print('exit %s' % colorbrightred.format(result[2]))
+               else:
+                    print(result[1].strip())
+                    if printexit: print('exit %s' % result[2])
+
+          if result[2] == 255 or result[2] == '-15': # 255 bad connection, -15 sigKILL
+               connectionerrors.append(result)
+     print('%s\n' % sep)
+
+else:
+     count = 0
+     for result in sorted(results, key=itemgetter(0)):
+          if result[2] == 255 or result[2] == '-15': # 255 bad connection, -15 sigKILL
+               connectionerrors.append(result)
+          elif options.testnegative:
+               if not result[2] == 0:
+                    print(result[0].split('\n')[0])
+                    count += 1
+          elif options.testpositive:
+               if result[2] == 0:
+                    print(result[0].split('\n')[0])
+                    count += 1
+
+# ------------------------------
+# connection error output (SSH)
+if not len(connectionerrors) == 0:
+     print('=' * 70)
+     print('%s ssh errors:\n%s ' % ((chevron + ' ') * 7, chevron))
+     connectionerrorhosts = [entry[0] for entry in connectionerrors]
+     print('%s %s' % (chevron, ' '.join(connectionerrorhosts)))
+     print(chevron)
+     for result in sorted(connectionerrors, key=itemgetter(0)):
+          thiserror =  result[1].strip()
+          thisexit = 'exit %s' % result[2]
+          if not options.monochrome:
+               thiserror = coloryellow.format(thiserror)
+               thisexit = colorbrightred.format(thisexit)
+          print('%s %s' % (chevron, sep[4:]))
+          print('%s %s' % (chevron,  result[0]))
+          print('%s %s' % (chevron, thiserror))
+          print('%s %s' % (chevron, thisexit))
+     print('%s %s' % (chevron, sep[4:]))
+     print('%s\n%s' % (chevron, (chevron + ' ') * 7))
+     print('=' * 70 + '\n')
+
+# ------------------------------
+# summary
+print('\n%s\n' % slashline)
+if verbose or dryrun:
+     print('\nSpace Delimited Hostlist:\n\n%s\n' % ' '.join(resultset))
+print(sep)
+if not dryrun:
+     print(' %s hosts processed.  %s connection errors' % (len(results),len(connectionerrors)))
+     if options.testpositive or options.testnegative:
+          if options.testpositive:
+               criteria = "--true"
+          else:
+               criteria = "--false"
+          print(' %s hosts matched criteria %s' % (count, criteria))
+else:
+     print(' %s hosts in this run.  DRYRUN ONLY, no commands executed.' % len(results))
+print(sep)
+print('\nRan: %s\nOn hosts that matched: %s [%s hosts]\n' % (command,' '.join(symv_spec), len(resultset)))
+print('\n%s: MUltiple SHell run complete\n' % sys.argv[0].split('/')[-1])
+
+# ------------------------------
+# blackbeard has left the building
+print('\n%s - done\n\n' % sys.argv[0])
+exit(0)
